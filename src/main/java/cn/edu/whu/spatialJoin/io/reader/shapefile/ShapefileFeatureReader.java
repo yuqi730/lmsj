@@ -1,0 +1,362 @@
+package cn.edu.whu.spatialJoin.io.reader.shapefile;
+
+import cn.edu.whu.spatialJoin.common.SpatialJoinOptions;
+import cn.edu.whu.spatialJoin.geom.Feature;
+import cn.edu.whu.spatialJoin.geom.IFeature;
+import cn.edu.whu.spatialJoin.io.reader.FeatureReader;
+import cn.edu.whu.spatialJoin.io.reader.SpatialReaderMetadata;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.LocalFileSystem;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.mapreduce.InputSplit;
+import org.apache.hadoop.mapreduce.lib.input.FileSplit;
+import org.apache.spark.sql.types.StructType;
+import org.geotools.referencing.CRS;
+import org.locationtech.jts.geom.Geometry;
+import org.opengis.referencing.FactoryException;
+import org.opengis.referencing.crs.CoordinateReferenceSystem;
+import utils.CRSServer;
+
+import java.io.*;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Enumeration;
+import java.util.List;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
+
+/**
+ * Reads shapefiles that contain geometries in .shp files and data in .dbf files.
+ */
+@SpatialReaderMetadata(
+    description = "Reads Esri-formatted shapefiles. The input can be a .shp file, a .zip file that contains" +
+        ".shp and .dbf files or a directory that contains a mix of these two",
+    extension = ".shp",
+    shortName = "shapefile",
+    filter = "*.zip\n*.shp",
+    noSplit = true
+)
+public class ShapefileFeatureReader extends FeatureReader {
+  /**Logger for this class*/
+  private static final Log LOG = LogFactory.getLog(ShapefileFeatureReader.class);
+
+  /**Used if the input is a ZIP file*/
+  protected ZipFile zipFile;
+
+  /**
+   * Only if the input is a ZIP file, this list contains the names of the .shp files (including the extension) that
+   * are contained within the ZIP file and have not been read yet. Once a file is opened, it is removed from this list.
+   * This means that if the ZIP file contains one shapefile, this list will be empty as soon as the first record is
+   * retrieved.
+   */
+  protected List<String> containedShapefiles;
+
+  /**An underlying reader for the shape file*/
+  protected ShapefileGeometryReader shapefileReader;
+
+  /**An underlying reader for the DBF file*/
+  protected DBFReader dbfReader;
+
+  /**Configuration of this reader*/
+  protected SpatialJoinOptions conf;
+
+  /**The local temporary ZIP file if the input is a remote ZIP file*/
+  protected File tempZipFile;
+
+  /**The coordinate reference system defined in the shapefile*/
+  protected CoordinateReferenceSystem crs;
+
+  /**Path to the .prj file if needed*/
+  protected String prjFileName;
+
+  /**Path to the .cpg file if needed*/
+  protected String cpgFileName;
+
+  /**SRID to set in created geometries*/
+  protected int srid;
+
+  /**The current value pointed by the reader*/
+  protected IFeature currentValue;
+
+  public ShapefileFeatureReader() {
+    this.shapefileReader = new ShapefileGeometryReader();
+    this.dbfReader = new DBFReader();
+  }
+
+  @Override
+  public void initialize(InputSplit inputSplit, SpatialJoinOptions conf) throws IOException {
+    FileSplit fsplit = (FileSplit) inputSplit;
+    Path shapefilePath = fsplit.getPath();
+    this.initialize(shapefilePath, conf);
+  }
+
+  /**
+   * Opens either a plain `.shp` file or a `.zip` archive that contains one or
+   * more shapefiles together with their DBF companions.
+   */
+  public void initialize(Path shapefilePath, SpatialJoinOptions conf) throws IOException {
+    this.conf = conf;
+    String shapeFileName = shapefilePath.getName();
+    int lastDot = shapeFileName.lastIndexOf('.');
+    String extension = shapeFileName.substring(lastDot).toLowerCase();
+    if (extension.equals(".shp")) {
+      // The input split points to the shapefile directly, assume the DBF file is in the same path
+      Path dbfFilePath = new Path(shapefilePath.getParent(), shapeFileName.substring(0, lastDot) + ".dbf");
+      this.prjFileName = new Path(shapefilePath.getParent(), shapeFileName.substring(0, lastDot) + ".prj").toString();
+      this.cpgFileName = new Path(shapefilePath.getParent(), shapeFileName.substring(0, lastDot) + ".cpg").toString();
+      this.shapefileReader.initialize(shapefilePath, conf);
+      this.dbfReader.setStringCharset(readCpgCharset(conf));
+      this.dbfReader.initialize(dbfFilePath, conf);
+    } else if (extension.equals(".zip")) {
+      // A compressed zip file, find the .shp and .dbf entries inside the file
+      FileSystem fs = shapefilePath.getFileSystem(conf.loadIntoHadoopConf(null));
+      if (! (fs instanceof LocalFileSystem)) {
+        // The ZIP file stored in a remote file system, copy the file locally to use the java.util.zip library
+        tempZipFile = File.createTempFile(shapeFileName, "temp");
+        fs.copyToLocalFile(shapefilePath, new Path(tempZipFile.toString()));
+        zipFile = new ZipFile(tempZipFile);
+      } else {
+        // The ZIP file is stored locally, open it directly
+        zipFile = new ZipFile(shapefilePath.toUri().getPath());
+      }
+      // Find the .dbf and .shp entries in the ZIP file
+      containedShapefiles = new ArrayList<>();
+      Enumeration<? extends ZipEntry> entries = zipFile.entries();
+      while (entries.hasMoreElements()) {
+        ZipEntry entry = entries.nextElement();
+        if (entry.getName().toLowerCase().endsWith(".shp") && !entry.getName().startsWith("_") && !entry.getName().startsWith("."))
+          containedShapefiles.add(entry.getName());
+      }
+      if (containedShapefiles.isEmpty())
+        LOG.warn(String.format("No .shp files found in the zip file '%s'", shapefilePath));
+      openNextShapefile();
+    } else {
+      throw new RuntimeException(String.format("Cannot open the shapefile '%s'. Unrecognized extension.", shapeFileName));
+    }
+    // Retrieve the spatial reference identifier and assume the default CRS to be EPSG:4326
+    this.srid = 4326;
+    CoordinateReferenceSystem crs = getCRS();
+    if (crs != null) {
+      int srid = CRSServer.crsToSRID(crs);
+      if (srid != 0)
+        this.srid = srid;
+    }
+    this.shapefileReader.setSRID(this.srid);
+  }
+
+  @Override
+  public CoordinateReferenceSystem getCRS() {
+    if (this.crs == null) {
+      FileSystem fileSystem = null;
+      InputStream in = null;
+      try {
+        if (this.prjFileName == null)
+          return null;
+        // Read and parse the associated .prj file
+        if (zipFile == null) {
+          // Read a local file
+          Path prjFilePath = new Path(this.prjFileName);
+          fileSystem = prjFilePath.getFileSystem(conf.loadIntoHadoopConf(null));
+          if (!fileSystem.exists(prjFilePath))
+            return null;
+          in = fileSystem.open(prjFilePath);
+        } else {
+          // Read from ZIP file
+          ZipEntry prjZipEntry = zipFile.getEntry(prjFileName);
+          if (prjZipEntry == null)
+            return null;
+          in = zipFile.getInputStream(prjZipEntry);
+        }
+        String wktCRS = "";
+        byte[] buffer = new byte[1024];
+        int length;
+        while ((length = in.read(buffer, 0, buffer.length)) > 0) {
+          wktCRS += new String(buffer, 0, length);
+        }
+        this.crs = CRS.parseWKT(wktCRS);
+      } catch (IOException e) {
+        this.crs = super.getCRS();
+      } catch (FactoryException e) {
+        e.printStackTrace();
+      } finally {
+        if (fileSystem != null) {
+          if (in != null) {
+            try {
+              in.close();
+            } catch (IOException e) {
+              e.printStackTrace();
+            }
+          }
+        }
+      }
+    }
+    return this.crs;
+  }
+
+  /**
+   * Opens the last shapefile in the list {@link #containedShapefiles} and removes the opened file from the list.
+   * If the file is opened correctly, a {@code true} is returned. If the list is empty or the file could not be opened,
+   * a {@code false is returned}
+   * @return {@code true} if a new file was opened.
+   * @throws IOException if an error happens while opening the shapefile
+   */
+  protected boolean openNextShapefile() throws IOException {
+    if (containedShapefiles == null || containedShapefiles.isEmpty())
+      return false;
+    this.prjFileName = null;
+    this.cpgFileName = null;
+    // Locate the SHP file in the ZIP file
+    String shpFileName = containedShapefiles.remove(containedShapefiles.size() - 1);
+    ZipEntry shpEntry = zipFile.getEntry(shpFileName);
+    if (shpEntry == null) {
+      LOG.warn(String.format("Could not retrieve the shapefile '%s' from the ZIP file '%s'", shpFileName, zipFile.getName()));
+      return false;
+    }
+    // Locate the DBF and SHX entries in the ZIP file
+    Enumeration<? extends ZipEntry> entries = zipFile.entries();
+    String dbfFileName = shpFileName.toLowerCase().replace(".shp", ".dbf");
+    String shxFileName = shpFileName.toLowerCase().replace(".shp", ".shx");
+    String prjFileName = shpFileName.toLowerCase().replace(".shp", ".prj");
+    String cpgFileName = shpFileName.toLowerCase().replace(".shp", ".cpg");
+    ZipEntry dbfEntry = null, shxEntry = null;
+    while (entries.hasMoreElements() && (dbfEntry == null || shxEntry == null || this.prjFileName == null || this.cpgFileName == null)) {
+      ZipEntry e = entries.nextElement();
+      if (e.getName().equalsIgnoreCase(dbfFileName))
+        dbfEntry = e;
+      else if (e.getName().equalsIgnoreCase(shxFileName))
+        shxEntry = e;
+      else if (e.getName().equalsIgnoreCase(prjFileName))
+        this.prjFileName = e.getName();
+      else if (e.getName().equalsIgnoreCase(cpgFileName))
+        this.cpgFileName = e.getName();
+    }
+    if (dbfEntry == null) {
+      LOG.warn(String.format("Could not retrieve the file '%s' from the ZIP file '%s'", dbfFileName, zipFile.getName()));
+      return false;
+    }
+    if (shxEntry == null) {
+      LOG.warn(String.format("Could not retrieve the file '%s' from the ZIP file '%s'", shxFileName, zipFile.getName()));
+      // Continue with a .shx file by assuming consecutive features in the shape file
+    }
+    // 1- Load all shape indexes
+    if (shxEntry != null) {
+      DataInputStream shxIn = new DataInputStream(new BufferedInputStream(zipFile.getInputStream(shxEntry)));
+      shapefileReader.readIndexFile(shxIn);
+      shxIn.close();
+    }
+    // 2- Initialize the shape file
+    DataInputStream shpIn = new DataInputStream(new BufferedInputStream(zipFile.getInputStream(shpEntry)));
+    shapefileReader.initialize(shpIn, conf);
+    // 3- Initialize the DBF file
+    DataInputStream dbfIn = new DataInputStream(new BufferedInputStream(zipFile.getInputStream(dbfEntry)));
+    dbfReader.setStringCharset(readCpgCharset(conf));
+    dbfReader.initialize(dbfIn, conf);
+    return true;
+  }
+
+  protected Charset readCpgCharset(SpatialJoinOptions conf) {
+    if (this.cpgFileName == null)
+      return StandardCharsets.UTF_8;
+    InputStream in = null;
+    try {
+      if (zipFile == null) {
+        Path cpgFilePath = new Path(this.cpgFileName);
+        FileSystem fileSystem = cpgFilePath.getFileSystem(conf.loadIntoHadoopConf(null));
+        if (!fileSystem.exists(cpgFilePath))
+          return StandardCharsets.UTF_8;
+        in = fileSystem.open(cpgFilePath);
+      } else {
+        ZipEntry cpgEntry = zipFile.getEntry(this.cpgFileName);
+        if (cpgEntry == null)
+          return StandardCharsets.UTF_8;
+        in = zipFile.getInputStream(cpgEntry);
+      }
+      BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
+      String charsetName = reader.readLine();
+      return parseCpgCharset(charsetName);
+    } catch (Exception e) {
+      return StandardCharsets.UTF_8;
+    } finally {
+      if (in != null) {
+        try {
+          in.close();
+        } catch (IOException ignored) {
+        }
+      }
+    }
+  }
+
+  protected Charset parseCpgCharset(String charsetName) {
+    if (charsetName == null)
+      return StandardCharsets.UTF_8;
+    String normalized = charsetName.trim();
+    if (normalized.isEmpty())
+      return StandardCharsets.UTF_8;
+    try {
+      return Charset.forName(normalized);
+    } catch (Exception ignored) {
+    }
+    if (normalized.matches("\\d+")) {
+      try {
+        return Charset.forName("windows-" + normalized);
+      } catch (Exception ignored) {
+      }
+      if ("936".equals(normalized))
+        return Charset.forName("GBK");
+    }
+    return StandardCharsets.UTF_8;
+  }
+
+  @Override
+  public boolean nextKeyValue() throws IOException {
+    if (!shapefileReader.nextKeyValue()) {
+      // Current file terminated. Try to open the next file
+      shapefileReader.close();
+      dbfReader.close();
+      if (!openNextShapefile())
+        return false;
+      shapefileReader.nextKeyValue();
+    }
+    // The shapefileReader might skip some records based on the filter MBR.
+    // Make sure we skip similar records in the DBF file
+    while (dbfReader.iRecord < shapefileReader.iShape) {
+      if (!dbfReader.nextKeyValue())
+        throw new RuntimeException(String.format("Could not reach record #%d in the DBF file", shapefileReader.iShape));
+    }
+    Geometry geometry = shapefileReader.getCurrentValue();
+    this.currentValue = Feature.create(dbfReader.getCurrentValue(), geometry);
+    return true;
+  }
+
+  @Override
+  public IFeature getCurrentValue() throws IOException {
+    return currentValue;
+  }
+
+  @Override
+  public float getProgress() throws IOException {
+    return dbfReader.getProgress();
+  }
+
+  @Override
+  public void close() throws IOException {
+    shapefileReader.close();
+    dbfReader.close();
+    if (zipFile != null) {
+      zipFile.close();
+      zipFile = null;
+    }
+    if (tempZipFile != null) {
+      tempZipFile.delete();
+      tempZipFile = null;
+    }
+  }
+
+  /** Returns the attribute schema coming from the DBF sidecar file. */
+  public StructType getSchema() {
+    return dbfReader.schema;
+  }
+}

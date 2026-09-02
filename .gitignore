@@ -1,0 +1,32 @@
+# Maven and Scala build output
+target/
+build/
+*.class
+
+# IDE metadata
+.idea/
+.vscode/
+.settings/
+.classpath
+.project
+*.iml
+*.iws
+*.ipr
+
+# Local runtime and generated artifacts
+tmp/
+temp/
+outputs/
+logs/
+*.log
+*.out
+*.err
+*.pid
+spark-warehouse/
+metastore_db/
+derby.log
+
+# OS metadata
+.DS_Store
+Thumbs.db
+

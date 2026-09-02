@@ -1,0 +1,624 @@
+package cn.edu.whu.spatialJoin.geom
+
+import cn.edu.whu.spatialJoin.geom.Feature.{readType, readValue, writeType, writeValue}
+import cn.edu.whu.spatialJoin.geom.util.{GeometryReader, GeometryWriter}
+import cn.edu.whu.spatialJoin.sql.GeometryDataType
+import cn.edu.whu.spatialJoin.utils.BitArray
+import com.esotericsoftware.kryo.io.{Input, Output}
+import com.esotericsoftware.kryo.{Kryo, KryoSerializable}
+import org.apache.spark.sql.Row
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.types._
+import org.apache.spark.unsafe.types.UTF8String
+import org.locationtech.jts.geom.Geometry
+import utils.{KryoInputToObjectInput, KryoOutputToObjectOutput}
+
+import java.io.{Externalizable, ObjectInput, ObjectOutput}
+import java.util.{SimpleTimeZone, TimeZone}
+
+/**
+ * A Row that contains a geometry
+ *
+ * Internally, this class prefers keeping geometry values in serialized binary
+ * form (`Array[Byte]`) to reduce memory pressure while data is only being
+ * carried around or filtered by partition metadata. The binary geometry is
+ * deserialized lazily only when the geometry field is actually accessed for
+ * computation through [[getGeometry]] or [[get]] on the geometry column.
+ *
+ * @param _values an initial list of values that might or might not contain a [[Geometry]]
+ * @param _schema the schema of the given values or `null` to auto-detect the types from the values
+ */
+class Feature(private var _values: Array[Any], private var _schema: StructType)
+  extends IFeature with Externalizable with KryoSerializable {
+
+  override def schema: StructType = _schema
+  private var values : Array[Any] =  if(_values == null) { new Array[Any](0) } else {_values.map{
+        case string : UTF8String => string.toString
+        case other : Any => other
+        case _ => null
+      }}
+  @transient private var cachedGeometries: Array[Geometry] = _
+  if (_schema == null && values != null)
+    _schema = Feature.inferSchema(values)
+  /**
+   * Default constructor for serialization/deserialization
+   */
+  def this() {
+    this(_values = null, _schema = null)
+  }
+
+  override def fieldIndex(name: String): Int = schema.fieldIndex(name)
+
+  /**
+   * Efficient Java serialization/deserialization. A feature is serialized as follows.
+   *  - Total number of attributes including the geometry, i.e., [[length]]
+   *  - The names of the attributes in order. If the name does not exist, an empty string is written.
+   *  - The types of the attributes, each written as a single byte.
+   *  - A compact bit mask of which attribute values are null.
+   *  - The values of the attributes in Java serialization form.
+   *  - The geometry is written using GeometryWriter with the SRID in its position in the list of values
+   *  - null values are skipped
+   * @param out the output to write to
+   */
+  override def writeExternal(out: ObjectOutput): Unit = {
+    // Number of attributes
+    out.writeShort(length)
+    if (length > 0) {
+      // Attribute names
+      for (field <- schema)
+        out.writeUTF(if (field.name == null) "" else field.name)
+      // Attribute types
+      for (field <- schema)
+        writeType(field.dataType, out)
+      // Attribute exists (bit mask)
+      val attributeExists = new BitArray(length)
+      for (i <- 0 until length)
+        attributeExists.set(i, !isNullAt(i))
+      attributeExists.writeBitsMinimal(out)
+      // Attribute values
+      for (i <- 0 until length; if !isNullAt(i)) {
+        val value = values(i)
+        writeValue(out, value, schema(i).dataType)
+      }
+    }
+  }
+
+  override def readExternal(in: ObjectInput): Unit = {
+    // Read number of attributes
+    val recordLength: Int = in.readShort()
+    val attributeNames = new Array[String](recordLength)
+    val attributeTypes = new Array[DataType](recordLength)
+    // Read attribute names
+    for (i <- 0 until recordLength)
+      attributeNames(i) = in.readUTF()
+    // Read attribute types
+    for (i <- 0 until recordLength)
+      attributeTypes(i) = readType(in)
+    this._schema = StructType((0 until recordLength).map(i => StructField(attributeNames(i), attributeTypes(i))))
+    // Read attribute exists
+    val attributeExists = new BitArray(recordLength)
+    attributeExists.readBitsMinimal(in)
+    // Read attribute values
+    this.values = new Array[Any](recordLength)
+    for (i <- 0 until recordLength; if attributeExists.get(i))
+      values(i) = readValue(in, attributeTypes(i))
+  }
+
+  override def write(kryo: Kryo, out: Output): Unit = writeExternal(new KryoOutputToObjectOutput(kryo, out))
+  override def read(kryo: Kryo, in: Input): Unit = readExternal(new KryoInputToObjectInput(kryo, in))
+
+  override def length: Int = if (values == null) 0 else values.length
+
+  override def isNullAt(i: Int): Boolean =
+    values == null || i < 0 || i >= values.length || values(i) == null
+
+  private def geometryIsStoredAsBinary(i: Int): Boolean =
+    i >= 0 && schema != null && i < schema.length && schema(i).dataType == GeometryDataType && values(i).isInstanceOf[Array[Byte]]
+
+  private def getCachedGeometry(i: Int): Geometry =
+    if (cachedGeometries == null || i >= cachedGeometries.length) null else cachedGeometries(i)
+
+  private def setCachedGeometry(i: Int, geometry: Geometry): Unit = {
+    if (cachedGeometries == null || cachedGeometries.length != length)
+      cachedGeometries = new Array[Geometry](length)
+    cachedGeometries(i) = geometry
+  }
+
+  private def materializeGeometryValue(i: Int): Geometry = {
+    val value = values(i)
+    value match {
+      case null => null
+      case geometry: Geometry => geometry
+      case bytes: Array[Byte] =>
+        var geometry = getCachedGeometry(i)
+        if (geometry == null) {
+          geometry = GeometryDataType.deserialize(bytes)
+          setCachedGeometry(i, geometry)
+        }
+        geometry
+      case other =>
+        other.asInstanceOf[Geometry]
+    }
+  }
+
+  override def get(i: Int): Any =
+    if (geometryIsStoredAsBinary(i)) materializeGeometryValue(i) else values(i)
+
+  override def getGeometry: Geometry =
+    if (iGeom == -1) EmptyGeometry.instance else materializeGeometryValue(iGeom)
+
+  /**
+   * Returns the raw serialized geometry bytes without forcing deserialization when
+   * this feature already stores geometry in binary form.
+   */
+  override def getGeometryBytes: Array[Byte] =
+    if (iGeom == -1 || isNullAt(iGeom)) {
+      null
+    } else {
+      values(iGeom) match {
+        case bytes: Array[Byte] => bytes
+        case geometry: Geometry => GeometryDataType.serialize(geometry)
+        case null => null
+        case _ =>
+          val geometry = materializeGeometryValue(iGeom)
+          if (geometry == null) null else GeometryDataType.serialize(geometry)
+      }
+    }
+
+  override def getStorageSize: Int = {
+    var size: Int = 0
+    for (i <- 0 until length) {
+      if (!isNullAt(i)) {
+        val value = values(i)
+        size += ((schema(i).dataType, value) match {
+          case (GeometryDataType, bytes: Array[Byte]) => bytes.length
+          case _ => IFeature.getStorageSize(get(i), schema(i).dataType)
+        })
+      }
+    }
+    size
+  }
+
+  override def getHeapEstimateBytes: Int = {
+    var size: Long = IFeature.baseFeatureHeapOverhead(length)
+    for (i <- 0 until length) {
+      if (!isNullAt(i)) {
+        val value = values(i)
+        size += ((schema(i).dataType, value) match {
+          case (GeometryDataType, bytes: Array[Byte]) => IFeature.getHeapEstimateSize(bytes, GeometryDataType)
+          case _ => IFeature.getHeapEstimateSize(value, schema(i).dataType)
+        })
+      }
+    }
+    IFeature.safeToInt(size)
+  }
+
+  override def getBinaryHeapEstimateBytes: Int = {
+    var size: Long = IFeature.baseFeatureHeapOverhead(length)
+    for (i <- 0 until length) {
+      if (!isNullAt(i)) {
+        val value = values(i)
+        size += ((schema(i).dataType, value) match {
+          case (GeometryDataType, bytes: Array[Byte]) => IFeature.estimateRetainedBinaryGeometryHeap(bytes)
+          case (GeometryDataType, geometry: Geometry) =>
+            IFeature.estimateRetainedBinaryGeometryHeap(GeometryDataType.serialize(geometry))
+          case (GeometryDataType, _) =>
+            IFeature.estimateRetainedBinaryGeometryHeap(getGeometryBytes)
+          case _ =>
+            IFeature.getHeapEstimateSize(value, schema(i).dataType)
+        })
+      }
+    }
+    IFeature.safeToInt(size)
+  }
+
+  override def getMaterializedGeometryHeapEstimateBytes: Int = {
+    var size: Long = IFeature.baseFeatureHeapOverhead(length)
+    for (i <- 0 until length) {
+      if (!isNullAt(i)) {
+        val value = values(i)
+        size += ((schema(i).dataType, value) match {
+          case (GeometryDataType, bytes: Array[Byte]) => IFeature.estimateMaterializedGeometryHeapFromBinary(bytes)
+          case (GeometryDataType, geometry: Geometry) => IFeature.estimateMaterializedGeometryHeap(geometry)
+          case (GeometryDataType, _) => IFeature.estimateMaterializedGeometryHeap(getGeometry)
+          case _ =>
+            IFeature.getHeapEstimateSize(value, schema(i).dataType)
+        })
+      }
+    }
+    IFeature.safeToInt(size)
+  }
+
+  /**
+   * Make a copy of this row. Since Feature is immutable, we just return the same object.
+   * @return the same object
+   */
+  override def copy(): Row = this
+
+  /**
+   * Convert it to an [[InternalRow]] to work with the DataSource API.
+   * Notice that [[Row]] and [[InternalRow]] are not compatible with each other due to the conflicting
+   * return data type of the function copy(). So, there is no way to create one class that implements both.
+   *
+   * @return an [[InternalRow]] representation of this feature, i.e., values without schema
+   */
+  def toInternalRow: InternalRow = new org.apache.spark.sql.catalyst.expressions.GenericInternalRow(values.map {
+    case string : String => UTF8String.fromString(string)
+    case geom : Array[Byte] => geom
+    case geom : Geometry => GeometryDataType.serialize(geom)
+    case other : Any => other
+    case _ => null
+  })
+}
+
+object Feature {
+
+  val UTC: TimeZone = new SimpleTimeZone(0, "UTC")
+  val JoinOIDFieldName: String = "oid"
+
+  /**
+   * Maps each data type to its ordinal number
+   */
+  val typeOrdinals: Map[DataType, Int] = Map(
+    ByteType -> 0,
+    ShortType -> 1,
+    IntegerType -> 2,
+    LongType -> 3,
+    FloatType -> 4,
+    DoubleType -> 5,
+    StringType -> 6,
+    BooleanType -> 7,
+    GeometryDataType -> 8,
+    DateType -> 9,
+    TimestampType -> 10,
+    MapType(BinaryType, BinaryType, valueContainsNull = true) -> 11,
+    ArrayType(BinaryType) -> 12
+  )
+
+  /**
+   * Maps each integer value to the corresponding data type
+   */
+  val ordinalTypes: Map[Int, DataType] = typeOrdinals.map(kv => (kv._2, kv._1))
+
+  /**
+   * Writes the given data type to the given output so that it can be read back using the function [[readType()]]
+   * @param t the SparkSQL data type of the value to write
+   * @param out the output to write the type to.
+   */
+  def writeType(t: DataType, out: ObjectOutput): Unit = t match {
+    case mp: MapType =>
+      out.writeByte(11)
+      writeType(mp.keyType, out)
+      writeType(mp.valueType, out)
+    case ap: ArrayType =>
+      out.writeByte(12)
+      writeType(ap.elementType, out)
+    case _ => out.writeByte(typeOrdinals.getOrElse(t, -1))
+  }
+
+  /**
+   * Read a data type from an input stream that was written with the function [[writeType()]]
+   * @param in the input stream to read from
+   * @return the created data type
+   */
+  def readType(in: ObjectInput): DataType = {
+    val typeOrdinal = in.readByte()
+    if (typeOrdinal == 11) {
+      // Indicates a map type
+      val keyType: DataType = readType(in)
+      val valueType: DataType = readType(in)
+      MapType(keyType, valueType, valueContainsNull = true)
+    } else if (typeOrdinal == 12) {
+      // Indicates an array type
+      val elementType: DataType = readType(in)
+      ArrayType(elementType, containsNull = true)
+    } else {
+      ordinalTypes.getOrElse(typeOrdinal, BinaryType)
+    }
+  }
+
+  /**
+   * Writes the given value with the corresponding data type to the output stream
+   * @param out the output stream to write to
+   * @param t the data type of the given value as specified in the Row schema
+   */
+  def writeValue(out: ObjectOutput, value: Any, t: DataType): Unit = t match {
+    case ByteType => out.writeByte(value.asInstanceOf[Number].byteValue())
+    case ShortType => out.writeShort(value.asInstanceOf[Number].shortValue())
+    case IntegerType => out.writeInt(value.asInstanceOf[Number].intValue())
+    case LongType => out.writeLong(value.asInstanceOf[Number].longValue())
+    case FloatType => out.writeFloat(value.asInstanceOf[Number].floatValue())
+    case DoubleType => out.writeDouble(value.asInstanceOf[Number].doubleValue())
+    case StringType => out.writeUTF(value.asInstanceOf[String])
+    case BooleanType => out.writeBoolean(value.asInstanceOf[Boolean])
+    case GeometryDataType =>
+      value match {
+        case bytes: Array[Byte] => out.write(bytes)
+        case geometry: Geometry => new GeometryWriter().write(geometry, out, true)
+        case null =>
+        case other => throw new IllegalArgumentException(s"Unsupported geometry value type ${other.getClass}")
+      }
+    case mapType: MapType =>
+      val map = value.asInstanceOf[Map[Any, Any]]
+      out.writeInt(map.size)
+      for ((k, v) <- map) {
+        writeValue(out, k, mapType.keyType)
+        writeValue(out, v, mapType.valueType)
+      }
+    case _ => out.writeObject(value)
+  }
+
+  /**
+   * Read a single value from an input stream according to the given data type.
+   * @param in the input stream to read from
+   * @param t the type of the attribute
+   * @return the attribute value read from the input stream
+   */
+  def readValue(in: ObjectInput, t: DataType): Any = t match {
+    case ByteType => in.readByte()
+    case ShortType => in.readShort()
+    case IntegerType => in.readInt()
+    case LongType => in.readLong()
+    case FloatType => in.readFloat()
+    case DoubleType => in.readDouble()
+    case StringType => in.readUTF()
+    case BooleanType => in.readBoolean()
+    case GeometryDataType => GeometryDataType.serialize(GeometryReader.DefaultInstance.parse(in))
+    case mt: MapType =>
+      val size = in.readInt()
+      val entries = new Array[(Any, Any)](size)
+      for (i <- 0 until size) {
+        val key = readValue(in, mt.keyType)
+        val value = readValue(in, mt.valueType)
+        entries(i) = (key, value)
+      }
+      entries.toMap
+    case _ => in.readObject()
+  }
+
+  /**
+   * Initialize the schema from the given parameters where the first field is always the geometry.
+   * If names and types are not null, they are simply padded
+   * together to create the schema. If any of the types is null, the value is used to detect the type.
+   * If the value is also null, the type is set to [[StringType]] by default
+   * @param names the list of names. Can be null and can contain nulls.
+   * @param types the list of types. Can be null and can contain nulls.
+   * @param values the list of values. Can be null and can contain nulls.
+   * @return
+   */
+  private def makeSchema(names: Array[String], types: Array[DataType], values: Array[Any]): StructType = {
+    val numAttributes: Int = if (names != null) names.length
+    else if (types != null) types.length
+    else if (values != null) values.length
+    else 0
+    val fields = new Array[StructField](numAttributes + 1)
+    fields(0) = StructField("g", GeometryDataType)
+    for (i <- 0 until numAttributes) {
+      var fieldType: DataType = null
+      if (types != null && types(i) != null) {
+        fieldType = types(i)
+      } else if (values != null && values(i) != null) {
+        fieldType = inferType(values(i))
+      } else if (values(i) == null) {
+        fieldType = NullType
+      } else {
+        fieldType = StringType
+      }
+      val name: String = if (names == null) null else names(i)
+      fields(i + 1) = StructField(name, fieldType)
+    }
+    StructType(fields)
+  }
+
+  protected def inferType(value: Any): DataType = value match {
+    case null => NullType
+    case _: String => StringType
+    case _: Integer | _: Int | _: Byte | _: Short => IntegerType
+    case _: java.lang.Long | _: Long => LongType
+    case _: java.lang.Double | _: Double | _: Float => DoubleType
+    case _: java.sql.Timestamp => TimestampType
+    case _: java.sql.Date => DateType
+    case _: java.lang.Boolean | _: Boolean => BooleanType
+    case _: Geometry => GeometryDataType
+    case map: scala.collection.immutable.HashMap[Object, Object] =>
+      // Detect the type of the value based on the first value
+      val keyType: DataType = inferType(map.keys.head)
+      val valueType: DataType = inferType(map.values.head)
+      DataTypes.createMapType(keyType, valueType)
+    case list: scala.collection.Seq[Object] =>
+      // Infer the type of the list based on the first element
+      DataTypes.createArrayType(if (list.isEmpty) BinaryType else inferType(list.head))
+  }
+
+  /**
+   * Create an array of values that contains the given geometry.
+   * The list of values is not expected to include a geometry field.
+   * @param geometry the geometry element to include in the array of values
+   * @param types the list of data types. Can be null
+   * @param values the list of values. Can be null
+   * @return a list of values with the given geometry included in it
+   */
+  private def makeValuesArray(geometry: Geometry, types: Array[DataType], values: Array[Any]): Array[Any] = {
+    val serializedGeometry =
+      if (geometry == null) null
+      else GeometryDataType.serialize(geometry)
+    val numAttributes = if (types != null) types.length
+    else if (values != null) values.length
+    else 0
+    if (values != null && numAttributes == values.length)
+      serializedGeometry +: values
+    else {
+      val retVal = new Array[Any](numAttributes + 1)
+      retVal(0) = serializedGeometry
+      if (values != null)
+        System.arraycopy(values, 0, retVal, 1, values.length)
+      retVal
+    }
+  }
+  /**
+   * Infer schema from the values. If a value is `null`, the type is inferred as [[BinaryType]]
+   * @param values the array of values
+   * @return
+   */
+  private def inferSchema(values: Array[Any]): StructType = StructType(values.map(v => StructField(null, detectType(v))))
+
+  /**
+   * Detect the data type for the given value.
+   * @param value A value to detect its type
+   * @return a detected data type for the given value.
+   */
+  private def detectType(value: Any): DataType = value match {
+    case null => BinaryType
+    case _: Byte => ByteType
+    case _: Short => ShortType
+    case _: Int => IntegerType
+    case _: Long => LongType
+    case _: Float => FloatType
+    case _: Double => DoubleType
+    case _: String => StringType
+    case x: java.math.BigDecimal => DecimalType(x.precision(), x.scale())
+    case _: java.sql.Date | _: java.time.LocalDate => DateType
+    case _: java.sql.Timestamp | _: java.time.Instant => TimestampType
+    case _: Array[Byte] => BinaryType
+    case r: Row => r.schema
+    case _: Geometry => GeometryDataType
+    case m: Map[Any, Any] =>
+      val keyType: DataType = if (m.isEmpty) StringType else detectType(m.head._1)
+      val valueType: DataType = if (m.isEmpty) StringType else detectType(m.head._2)
+      MapType(keyType, valueType, valueContainsNull = true)
+    case _ => BinaryType
+  }
+
+  /**
+   * Create a [[Feature]] from the given row and the given geometry.
+   * If the row already contains a geometry field, it is overridden.
+   * If the row does not contain a geometry field, the geometry is prepended.
+   * If the given geometry is null, the original geometry is kept intact.
+   * @param row and existing row that might or might not contain a geometry
+   * @param geometry the new geometry to use in the created feature
+   * @return a [[Feature]] with the given values and geometry
+   */
+  def create(row: Row, geometry: Geometry): Feature =
+    if (row == null) {
+      new Feature(Array(GeometryDataType.serialize(geometry)), StructType(Seq(StructField("g", GeometryDataType))))
+    } else {
+      val rowValues: Array[Any] = row match {
+        case feature: Feature => feature.values.clone()
+        case _ => Row.unapplySeq(row).get.toArray
+      }
+      val rowSchema: StructType = if (row.schema != null) row.schema else inferSchema(rowValues)
+      val iGeom: Int = rowSchema.indexWhere(_.dataType == GeometryDataType)
+      if (iGeom == -1) {
+        // No geometry field, prepend it
+        val values: Array[Any] = GeometryDataType.serialize(geometry) +: rowValues
+        val schema: Seq[StructField] = Seq(StructField("g", GeometryDataType)) ++ rowSchema
+        new Feature(values, StructType(schema))
+      } else {
+        // A geometry field already exists, replace the geometry
+        val values: Array[Any] = row match {
+          case feature: Feature => feature.values.clone()
+          case _ => Row.unapplySeq(row).get.toArray
+        }
+        if (geometry != null)
+          values(iGeom) = GeometryDataType.serialize(geometry)
+        new Feature(values, rowSchema)
+      }
+    }
+
+  /**
+   * Concatenates two rows together to form a feature.
+   * @param feature a row that contains a geometry
+   * @param row another row to append at the end of the feature
+   * @return a new feature that combines the values and schema from both
+   */
+  def concat(feature: IFeature, row: Row): IFeature = {
+    val featureValues: Seq[Any] = feature match {
+      case f: Feature => f.values.toSeq
+      case _ => Row.unapplySeq(feature).get
+    }
+    val values = featureValues ++ Row.unapplySeq(row).get
+    val schema = feature.schema ++ row.schema
+    new Feature(values.toArray, StructType(schema))
+  }
+
+  /**
+   * Appends an additional attribute to the given feature and returns a new feature
+   * @param feature the feature to append to. This feature is not modified.
+   * @param value the value to append.
+   * @param name (Optional) the name of the new attribute
+   * @param dataType (Optional) the type of the additional attribute.
+   * @return a new feature that contains the geometry and all attributes of the input feature + the new attribute.
+   */
+  def append(feature: IFeature, value: Any, name: String = null, dataType: DataType = null): IFeature = {
+    // Appends a single value to an existing feature
+    val featureValues: Seq[Any] = feature match {
+      case f: Feature => f.values.toSeq
+      case _ => Row.unapplySeq(feature).get
+    }
+    val values: Seq[Any] = featureValues :+ value
+    val schema: Seq[StructField] = feature.schema :+ StructField(name, if (dataType != null) dataType else detectType(value))
+    new Feature(values.toArray, StructType(schema))
+  }
+
+  /**
+   * Projects a feature to the minimal join-time shape used by the current operator layer.
+   *
+   * The resulting feature keeps only:
+   * - the geometry field, preferably as the original serialized binary if already available
+   * - a lightweight long OID used to identify the feature during join processing
+   *
+   * This method intentionally avoids materializing the geometry unless the source feature does
+   * not expose its raw serialized form.
+   *
+   * @param feature source feature
+   * @param oid lightweight join-time object identifier
+   * @return a feature containing only geometry and oid
+   */
+  def projectToGeometryAndOid(feature: IFeature, oid: Long): Feature = {
+    val serializedGeometry: Array[Byte] =
+      if (feature == null || feature.iGeom == -1) {
+        null
+      } else {
+        feature match {
+          case f: Feature if f.geometryIsStoredAsBinary(f.iGeom) =>
+            f.values(f.iGeom).asInstanceOf[Array[Byte]]
+          case f: Feature =>
+            val rawValue = f.values(f.iGeom)
+            rawValue match {
+              case bytes: Array[Byte] => bytes
+              case geometry: Geometry => GeometryDataType.serialize(geometry)
+              case null => null
+              case _ => GeometryDataType.serialize(feature.getGeometry)
+            }
+          case _ =>
+            val geometry = feature.getGeometry
+            if (geometry == null) null else GeometryDataType.serialize(geometry)
+        }
+      }
+    val schema = StructType(Seq(
+      StructField("g", GeometryDataType),
+      StructField(JoinOIDFieldName, LongType)
+    ))
+    new Feature(Array[Any](serializedGeometry, oid), schema)
+  }
+
+  /**
+   * Projects an already-built geometry to the minimal join-time shape.
+   *
+   * This is used by pre-partition splitting: once a complex geometry has been split into
+   * fragments, each fragment is treated as a lightweight feature before summaries,
+   * partitioning, and materialization are computed.
+   */
+  def projectGeometryAndOid(geometry: Geometry, oid: Long): Feature = {
+    val serializedGeometry = if (geometry == null) null else GeometryDataType.serialize(geometry)
+    val schema = StructType(Seq(
+      StructField("g", GeometryDataType),
+      StructField(JoinOIDFieldName, LongType)
+    ))
+    new Feature(Array[Any](serializedGeometry, oid), schema)
+  }
+
+  def create(geometry: Geometry, _names: Array[String], _types: Array[DataType], _values: Array[Any]): Feature =
+    new Feature(Feature.makeValuesArray(geometry, _types, _values), Feature.makeSchema(_names, _types, _values))
+
+}
