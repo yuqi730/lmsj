@@ -31,7 +31,7 @@ reloads only the partitions required by each job.
 | `core.partitioning` | Grid, STR, KD-tree, Hilbert, and memory-aware LAHilbert partition construction and refinement. |
 | `core.partitioning.helper` | Compact feature descriptors, hierarchy construction, and partition-assignment strategies. |
 | `cost` | Partition load, cost, and complexity profiles used during job planning. |
-| `execution` | Job grouping, queue planning, bounded dispatch, and per-job execution results. |
+| `execution` | Capacity-first dynamic-programming job grouping, queue planning, bounded dispatch, and per-job execution results. |
 | `operator` | Public read, partition, and full spatial-join pipeline APIs. |
 | `geom` / `geom.util` | Geometry-backed feature types, envelopes, binary geometry metadata, readers, and writers. |
 | `io.reader` | CSV/WKT, GeoJSON, and Shapefile input support. |
@@ -192,8 +192,8 @@ remote workers.
 ### Pass advanced options
 
 Use `-ExtraOption` to forward configuration keys that are not exposed as named
-script parameters. The following example changes only the HIGH/NORMAL
-classification rule and keeps the stable execution profile otherwise:
+script parameters. The following example supplies an explicit per-task-unit
+memory budget while keeping the rest of the stable execution profile unchanged:
 
 ```powershell
 .\scripts\run_full_pipeline.ps1 `
@@ -202,8 +202,7 @@ classification rule and keeps the stable execution profile otherwise:
   -RightPath 'D:\data\right.csv' `
   -Format 'wkt(0)' `
   -ExtraOption @(
-    '--sj.execution.highComplexity.lambda=1.5',
-    '--sj.execution.highComplexity.quantile=0.9'
+    '--sj.execution.job.memoryBudget=2g'
   )
 ```
 
@@ -223,8 +222,10 @@ Both example methods apply the same reproducible profile before user overrides:
 3. Null, empty, and invalid geometries are filtered before summaries and
    partition construction; effective profiles then use `ci-hybrid` intensity
    with `alpha=0.6`.
-4. `JobPlanner` packs at most `12` partitions into one task unit using `0.8` of
-   the global execution-memory budget.
+4. `JobPlanner` sorts effective partitions by the selected intensity and applies
+   capacity-first dynamic programming. It minimizes the number of task units first
+   and total within-unit intensity SSE second; every unit contains at most `12`
+   partitions and uses at most `0.8` of the global execution-memory budget.
 5. `JobDispatcher` uses resource-aware concurrent execution with a six-thread
    pool and at most six active jobs.
 6. Partition-local execution uses the binary MBR filter, automatic plane-sweep

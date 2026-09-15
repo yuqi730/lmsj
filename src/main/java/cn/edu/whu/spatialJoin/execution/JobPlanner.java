@@ -15,10 +15,10 @@ import java.util.List;
 /**
  * Planner that converts effective-partition load statistics into a queue of future jobs.
  *
- * <p>The current implementation follows the design's partition-intensity path:
- * 1. compute one scalar partition intensity from the sum of feature complexities
- * 2. split partitions into HIGH/NORMAL groups
- * 3. pack partitions into memory-feasible jobs while minimizing deviation
+ * <p>The stable execution path uses the scalar intensity already stored in each partition profile,
+ * sorts partitions by that intensity, and applies capacity-first dynamic programming. The planner
+ * first minimizes the number of task units and then minimizes their total within-unit intensity SSE,
+ * subject to the per-unit partition-count and memory limits.
  */
 public final class JobPlanner implements Serializable {
 
@@ -196,14 +196,18 @@ public final class JobPlanner implements Serializable {
   /**
    * Builds the final job-queue plan from one load descriptor per effective partition.
    *
-   * <p>The method performs three steps in order: estimate partition costs,
-   * classify them into HIGH/NORMAL complexity, then pack them into memory-feasible jobs.
+   * <p>The dynamic program groups adjacent entries of the intensity-sorted partition sequence.
+   * Its lexicographic objective minimizes task-unit count first and total within-unit intensity
+   * SSE second. Every resulting unit respects both the memory budget and partition-count cap.
    *
    * @param inputs one execution profile per effective partition.
    * @return a complete job-queue plan containing the classification summary and the frozen job groups.
    */
   public JobQueueExecutionPlan buildJobPlan(List<PartProfile> inputs) {
-    return buildJobPlanFromCosts(classifyPartitionCosts(estimatePartitionCosts(inputs)));
+    return CapacityFirstSseJobPlanner.build(
+        inputs == null ? Collections.emptyList() : inputs,
+        maxPartitionsPerJob,
+        jobMemoryBudgetBytes);
   }
 
   /**
