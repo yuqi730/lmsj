@@ -350,8 +350,6 @@ public class LAHilbertPartitioner extends HCurvePartitioner {
     // only partitions that finally receive both left and right sides, is still finalized by
     // the execution-side mapping/statistics stages described after document section 1.1.
     List<WorkingPartition> initialPartitions = buildInitialHilbertPartitions(initialLevelFeatures, initialLevelIndex);
-    if (hasRefinementPruningSides())
-      initialPartitions = attachRefinementSideAssignments(initialPartitions);
     List<PartitionLeaf> leaves = new ArrayList<>();
     for (WorkingPartition partition : initialPartitions)
       refinePartition(partition, hierarchy == null ? new AbstractFeatureHierarchy(new AbstractFeature[][]{features}) : hierarchy, leaves);
@@ -700,6 +698,8 @@ public class LAHilbertPartitioner extends HCurvePartitioner {
     final int numDimensions = inputMBR.getCoordinateDimension();
     final int sidePartitions = initialHilbertOrder <= 0 ? 1 : (1 << initialHilbertOrder);
     Map<CellKey, IntArray> groupedFeatures = new LinkedHashMap<>();
+    final boolean sideAware = hasRefinementPruningSides();
+    Map<CellKey, CellAssignments> sides = new LinkedHashMap<>();
 
     for (int i = 0; i < features.length; i++) {
       AbstractFeature feature = features[i];
@@ -708,8 +708,17 @@ public class LAHilbertPartitioner extends HCurvePartitioner {
       int[] coords = new int[numDimensions];
       for (int d = 0; d < numDimensions; d++)
         coords[d] = locateCell(featureRepresentativeCoord(feature, d), d, sidePartitions);
-      CellKey key = new CellKey(coords);
-      groupedFeatures.computeIfAbsent(key, k -> new IntArray()).add(i);
+      // Ownership determines load and split points; intersection determines coverage.
+      groupedFeatures.computeIfAbsent(new CellKey(coords), k -> new IntArray()).add(i);
+      final int index = i;
+      visitInitialCells(feature, sidePartitions, key -> {
+        groupedFeatures.computeIfAbsent(key, k -> new IntArray());
+        if (sideAware) {
+          int nLeft = refinementPruningLeftFeatures.length;
+          sides.computeIfAbsent(key, k -> new CellAssignments())
+              .add(index < nLeft ? index : index - nLeft, index < nLeft);
+        }
+      });
     }
 
     List<WorkingPartition> partitions = new ArrayList<>(groupedFeatures.size());
@@ -720,16 +729,18 @@ public class LAHilbertPartitioner extends HCurvePartitioner {
       for (int d = 0; d < numDimensions; d++)
         centers[d][idx] = envelope.getCenter(d);
       int[] featureIndexes = entry.getValue().toArray();
-      int memberCount = sumMemberCount(features, featureIndexes);
+      CellAssignments assignments = sides.get(entry.getKey());
       partitions.add(new WorkingPartition(
           envelope,
           null,
           0,
           -1,
-          sumStorageBytes(features, featureIndexes),
-          memberCount,
+          featureIndexes.length == 0 ? 0L : sumStorageBytes(features, featureIndexes),
+          featureIndexes.length == 0 ? 0 : sumMemberCount(features, featureIndexes),
           levelIndex,
-          featureIndexes));
+          featureIndexes,
+          assignments == null ? null : assignments.leftIndexes.toArray(),
+          assignments == null ? null : assignments.rightIndexes.toArray()));
       idx++;
     }
 
@@ -1043,22 +1054,6 @@ public class LAHilbertPartitioner extends HCurvePartitioner {
     return refinementPruningLeftFeatures != null && refinementPruningRightFeatures != null;
   }
 
-  private List<WorkingPartition> attachRefinementSideAssignments(List<WorkingPartition> partitions) {
-    List<WorkingPartition> sideAware = new ArrayList<>(partitions == null ? 0 : partitions.size());
-    if (partitions == null)
-      return sideAware;
-    int[] allLeftIndexes = sequentialIndexes(refinementPruningLeftFeatures.length);
-    int[] allRightIndexes = sequentialIndexes(refinementPruningRightFeatures.length);
-    for (WorkingPartition partition : partitions) {
-      if (partition == null)
-        continue;
-      sideAware.add(partition.withSideAssignments(
-          filterIndexesByEnvelope(refinementPruningLeftFeatures, allLeftIndexes, partition.envelope),
-          filterIndexesByEnvelope(refinementPruningRightFeatures, allRightIndexes, partition.envelope)));
-    }
-    return sideAware;
-  }
-
   private WorkingPartition attachRefinementSideAssignments(WorkingPartition child,
                                                            WorkingPartition parent) {
     return child.withSideAssignments(
@@ -1070,13 +1065,6 @@ public class LAHilbertPartitioner extends HCurvePartitioner {
             refinementPruningRightFeatures,
             parent.rightFeatureIndexes,
             child.envelope));
-  }
-
-  private static int[] sequentialIndexes(int length) {
-    int[] indexes = new int[Math.max(0, length)];
-    for (int i = 0; i < indexes.length; i++)
-      indexes[i] = i;
-    return indexes;
   }
 
   /**
@@ -1285,19 +1273,20 @@ public class LAHilbertPartitioner extends HCurvePartitioner {
     for (int childOrder = 0; childOrder < childEnvelopes.length; childOrder++) {
       EnvelopeNDLite childEnvelope = childEnvelopes[childOrder];
       int[] childFeatures = childFeatureGroups[childOrder];
-      if (childFeatures.length == 0)
-        continue;
       children.add(new WorkingPartition(
           childEnvelope,
           composeChildCode(parent.code, childOrder, width),
           parent.depth + 1,
           -1,
-          sumStorageBytes(features, childFeatures),
-          sumMemberCount(features, childFeatures),
+          childFeatures.length == 0 ? 0L : sumStorageBytes(features, childFeatures),
+          childFeatures.length == 0 ? 0 : sumMemberCount(features, childFeatures),
           parent.levelIndex,
           childFeatures));
     }
-    return children.size() <= 1 ? null : children.toArray(new WorkingPartition[0]);
+    int occupied = 0;
+    for (int[] group : childFeatureGroups)
+      if (group.length != 0) occupied++;
+    return occupied <= 1 ? null : children.toArray(new WorkingPartition[0]);
   }
 
   /**
@@ -1811,44 +1800,37 @@ public class LAHilbertPartitioner extends HCurvePartitioner {
                                                int sidePartitions,
                                                Map<CellKey, CellAssignments> groupedAssignments,
                                                boolean leftSide) {
+    visitInitialCells(feature, sidePartitions, key ->
+        groupedAssignments.computeIfAbsent(key, ignored -> new CellAssignments()).add(featureIndex, leftSide));
+  }
+
+  private void visitInitialCells(AbstractFeature feature, int sidePartitions,
+                                 java.util.function.Consumer<CellKey> visitor) {
     int[] minCoords = new int[inputMBR.getCoordinateDimension()];
     int[] maxCoords = new int[inputMBR.getCoordinateDimension()];
     for (int d = 0; d < inputMBR.getCoordinateDimension(); d++) {
       minCoords[d] = locateCell(feature.getMinCoord(d), d, sidePartitions);
       maxCoords[d] = locateCell(feature.getMaxCoord(d), d, sidePartitions);
+      // Include both owners of a closed grid edge (using the same arithmetic as createCellEnvelope).
+      double lo = inputMBR.getMinCoord(d), width = inputMBR.getMaxCoord(d) - lo;
+      if (minCoords[d] > 0 && feature.getMinCoord(d) <= lo + width * minCoords[d] / sidePartitions)
+        minCoords[d]--;
+      if (width > 0 && maxCoords[d] < sidePartitions - 1 &&
+          feature.getMaxCoord(d) >= lo + width * (maxCoords[d] + 1) / sidePartitions)
+        maxCoords[d]++;
     }
-    collectIntersectingInitialCells(feature, featureIndex, minCoords, maxCoords, 0, new int[minCoords.length], groupedAssignments, leftSide);
+    visitInitialCells(minCoords, maxCoords, 0, new int[minCoords.length], visitor);
   }
 
-  /**
-   * Recursively enumerates the multi-dimensional initial cells overlapped by one feature.
-   *
-   * @param feature feature being replicated
-   * @param featureIndex index of the feature in the side-specific feature array
-   * @param minCoords per-axis minimum intersecting cell index
-   * @param maxCoords per-axis maximum intersecting cell index
-   * @param axis recursion cursor over dimensions
-   * @param currentCoords mutable work array that records the current cell during enumeration
-   * @param groupedAssignments accumulator of cell-to-feature assignments
-   * @param leftSide whether the feature belongs to the left input
-   */
-  private void collectIntersectingInitialCells(AbstractFeature feature,
-                                               int featureIndex,
-                                               int[] minCoords,
-                                               int[] maxCoords,
-                                               int axis,
-                                               int[] currentCoords,
-                                               Map<CellKey, CellAssignments> groupedAssignments,
-                                               boolean leftSide) {
+  private void visitInitialCells(int[] minCoords, int[] maxCoords, int axis, int[] currentCoords,
+                                 java.util.function.Consumer<CellKey> visitor) {
     if (axis == currentCoords.length) {
-      int[] coords = Arrays.copyOf(currentCoords, currentCoords.length);
-      CellKey key = new CellKey(coords);
-      groupedAssignments.computeIfAbsent(key, ignored -> new CellAssignments()).add(featureIndex, leftSide);
+      visitor.accept(new CellKey(currentCoords));
       return;
     }
     for (int coord = minCoords[axis]; coord <= maxCoords[axis]; coord++) {
       currentCoords[axis] = coord;
-      collectIntersectingInitialCells(feature, featureIndex, minCoords, maxCoords, axis + 1, currentCoords, groupedAssignments, leftSide);
+      visitInitialCells(minCoords, maxCoords, axis + 1, currentCoords, visitor);
     }
   }
 
